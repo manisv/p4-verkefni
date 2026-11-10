@@ -23,6 +23,7 @@
 #define ACTION_TIMEOUT_MS       5000
 #define TEST_ACTION_TIMEOUT_MS  2000
 #define CLOSE_TIMEOUT_MS        5000
+#define CONNECT_TIMEOUT_MS      5000
 #define CLOSE_MAX_RETRIES       3
 
 typedef struct {
@@ -47,6 +48,8 @@ static struct {
     int8_t temp;
 
     pending_action_t pending[MAX_PENDING];
+
+    uint32_t connect_sent_ms;
 
     uint16_t close_seq;
     uint32_t close_sent_ms;
@@ -168,6 +171,7 @@ static bool crane_connect_internal(uint8_t id, bool test)
     pkt.seq = 0;
     pkt.d.conn.challenge = 0;
 
+    state.connect_sent_ms = now_ms();
     crane_send_packet(&pkt);
 
     ESP_LOGI(TAG, "Sent CONNECT SYN to 0x%02x%s",
@@ -353,7 +357,14 @@ static void crane_service_task(void* arg)
 
         xSemaphoreTake(state.lock, portMAX_DELAY);
 
-        if (state.closing) {
+        if (state.connecting) {
+            if (t - state.connect_sent_ms >= CONNECT_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "No connection answer from crane 0x%02x",
+                         state.crane_id);
+                state.connecting = false;
+                state.test_mode = false;
+            }
+        } else if (state.closing) {
             if (t - state.close_sent_ms >= CLOSE_TIMEOUT_MS) {
                 if (state.close_retries < CLOSE_MAX_RETRIES) {
                     crane_packet_t pkt;
