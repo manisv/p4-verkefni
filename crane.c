@@ -30,6 +30,7 @@ typedef struct {
     crane_packet_t pkt;
     uint32_t sent_ms;
     bool used;
+    bool sent;  /* false = queued, waiting for the previous action's ACK */
 } pending_action_t;
 
 static struct {
@@ -88,27 +89,48 @@ static void pending_clear_locked(void)
     memset(state.pending, 0, sizeof(state.pending));
 }
 
-static void pending_add_locked(const crane_packet_t* pkt, uint32_t sent_ms)
+static bool pending_add_locked(const crane_packet_t* pkt)
 {
     for (int i = 0; i < MAX_PENDING; ++i) {
         if (!state.pending[i].used) {
             state.pending[i].used = true;
+            state.pending[i].sent = false;
             state.pending[i].pkt = *pkt;
-            state.pending[i].sent_ms = sent_ms;
+            state.pending[i].sent_ms = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Stop-and-wait: keep at most one action in flight. If nothing is
+ * waiting for an ACK, send the queued action with the lowest seq.
+ */
+static void pending_pump_locked(uint32_t t)
+{
+    int next = -1;
+
+    for (int i = 0; i < MAX_PENDING; ++i) {
+        if (!state.pending[i].used) {
+            continue;
+        }
+        if (state.pending[i].sent) {
             return;
         }
-    }
-
-    /* Queue full: overwrite the oldest pending entry. */
-    int oldest = 0;
-    for (int i = 1; i < MAX_PENDING; ++i) {
-        if (state.pending[i].sent_ms < state.pending[oldest].sent_ms) {
-            oldest = i;
+        if (next < 0 || state.pending[i].pkt.seq < state.pending[next].pkt.seq) {
+            next = i;
         }
     }
 
-    state.pending[oldest].pkt = *pkt;
-    state.pending[oldest].sent_ms = sent_ms;
+    if (next >= 0) {
+        crane_send_packet(&state.pending[next].pkt);
+        state.pending[next].sent = true;
+        state.pending[next].sent_ms = t;
+        ESP_LOGI(TAG, "Sent ACTION cmd=0x%02x seq=%u",
+                 state.pending[next].pkt.d.action.cmd,
+                 state.pending[next].pkt.seq);
+    }
 }
 
 static void pending_ack_locked(uint16_t seq)
@@ -123,7 +145,8 @@ static void pending_ack_locked(uint16_t seq)
 static void pending_resend_seq_locked(uint16_t seq, uint32_t sent_ms)
 {
     for (int i = 0; i < MAX_PENDING; ++i) {
-        if (state.pending[i].used && state.pending[i].pkt.seq == seq) {
+        if (state.pending[i].used && state.pending[i].sent &&
+            state.pending[i].pkt.seq == seq) {
             crane_send_packet(&state.pending[i].pkt);
             state.pending[i].sent_ms = sent_ms;
             ESP_LOGW(TAG, "Resent action seq=%u after NAK", seq);
@@ -229,13 +252,17 @@ void crane_action(uint8_t action)
     memset(&pkt, 0, sizeof(pkt));
     pkt.type = CRANE_ACTION;
     pkt.flags = 0;
-    pkt.seq = state.seq++;
+    pkt.seq = state.seq;
     pkt.d.action.cmd = action;
 
-    pending_add_locked(&pkt, now_ms());
-    crane_send_packet(&pkt);
+    if (!pending_add_locked(&pkt)) {
+        xSemaphoreGive(state.lock);
+        serial_write_line("Crane action queue full");
+        return;
+    }
+    state.seq++;
 
-    ESP_LOGI(TAG, "Sent ACTION cmd=0x%02x seq=%u", action, pkt.seq);
+    pending_pump_locked(now_ms());
 
     xSemaphoreGive(state.lock);
 }
@@ -300,6 +327,7 @@ void crane_receive(const lownet_frame_t* frame)
         } else {
             state.ack_seq = pkt.seq;
             pending_ack_locked(pkt.seq);
+            pending_pump_locked(now_ms());
         }
 
         state.backlog = pkt.d.status.backlog;
@@ -391,7 +419,7 @@ static void crane_service_task(void* arg)
             }
         } else if (state.connected) {
             for (int i = 0; i < MAX_PENDING; ++i) {
-                if (state.pending[i].used &&
+                if (state.pending[i].used && state.pending[i].sent &&
                     (t - state.pending[i].sent_ms) >= state.action_timeout_ms) {
                     crane_send_packet(&state.pending[i].pkt);
                     state.pending[i].sent_ms = t;
