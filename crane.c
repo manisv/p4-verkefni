@@ -30,7 +30,7 @@ typedef struct {
     crane_packet_t pkt;
     uint32_t sent_ms;
     bool used;
-    bool sent;  /* false = queued, waiting for the previous action's ACK */
+    bool sent;
 } pending_action_t;
 
 static struct {
@@ -103,10 +103,6 @@ static bool pending_add_locked(const crane_packet_t* pkt)
     return false;
 }
 
-/*
- * Stop-and-wait: keep at most one action in flight. If nothing is
- * waiting for an ACK, send the queued action with the lowest seq.
- */
 static void pending_pump_locked(uint32_t t)
 {
     int next = -1;
@@ -197,7 +193,7 @@ static bool crane_connect_internal(uint8_t id, bool test)
     state.connect_sent_ms = now_ms();
     crane_send_packet(&pkt);
 
-    ESP_LOGI(TAG, "Sent CONNECT SYN to 0x%02x%s",
+    ESP_LOGI(TAG, "Sent CONNECT to 0x%02x%s",
              id, test ? " (TEST)" : "");
 
     xSemaphoreGive(state.lock);
@@ -516,7 +512,6 @@ static void crane_test_task(void* arg)
     }
 
     if (ok) {
-        /* Step 2-4: light on, forward twice, backward once. */
         crane_action(CRANE_LIGHT_ON);
         crane_action(CRANE_FWD);
         crane_action(CRANE_FWD);
@@ -530,7 +525,6 @@ static void crane_test_task(void* arg)
     }
 
     if (ok) {
-        /* Step 6: lower hook twice. */
         crane_action(CRANE_DOWN);
         crane_action(CRANE_DOWN);
 
@@ -542,7 +536,6 @@ static void crane_test_task(void* arg)
     }
 
     if (ok) {
-        /* Step 8-10: up twice, backward once, light off. */
         crane_action(CRANE_UP);
         crane_action(CRANE_UP);
         crane_action(CRANE_REV);
@@ -575,7 +568,6 @@ static void crane_test_task(void* arg)
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     } else {
-        /* Best-effort cleanup. */
         xSemaphoreTake(state.lock, portMAX_DELAY);
         bool connected = state.connected;
         xSemaphoreGive(state.lock);
